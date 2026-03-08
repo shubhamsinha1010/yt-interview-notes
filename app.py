@@ -175,9 +175,7 @@ def main():
             st.warning("No Q&A content was returned.")
             return
 
-        st.success("Done! Review below and download the .txt file.")
-        st.text_area("Interview Q&A", value=qa_text, height=400, label_visibility="collapsed")
-
+        st.success("Done! Review below and save the file to your device.")
         # Filename: include video title when available for easier reference
         video_title = get_video_title(video_id)
         if video_title:
@@ -186,22 +184,27 @@ def main():
         else:
             txt_filename = f"interview_notes_{video_id}.txt"
 
-        # Save to disk in the configured folder
+        # Primary way for users to save locally: browser download (works for everyone, including Cloud)
+        st.download_button(
+            label="📥 Download .txt to your device",
+            data=qa_text,
+            file_name=txt_filename,
+            mime="text/plain",
+            type="primary",
+        )
+        st.caption("The file will save to your **Downloads** folder (or your browser’s download location). You can open it in any text editor.")
+
+        st.text_area("Interview Q&A", value=qa_text, height=400, label_visibility="collapsed")
+
+        # Optional: also save to a folder when running locally and path is writable
         try:
             os.makedirs(SAVE_DIR, exist_ok=True)
             save_path = os.path.join(SAVE_DIR, txt_filename)
             with open(save_path, "w", encoding="utf-8") as f:
                 f.write(qa_text)
-            st.caption(f"Saved to: `{save_path}`")
-        except OSError as e:
-            st.warning(f"Could not save to folder: {e}")
-
-        st.download_button(
-            label="Download as .txt",
-            data=qa_text,
-            file_name=txt_filename,
-            mime="text/plain",
-        )
+            st.caption(f"Also saved on this machine at: `{save_path}`")
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":
