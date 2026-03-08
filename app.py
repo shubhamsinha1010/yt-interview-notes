@@ -92,19 +92,70 @@ def sanitize_filename(title: str, max_len: int = 80) -> str:
 TRANSCRIPT_LANGUAGE_FALLBACKS = ("en", "hi", "es", "fr", "de", "pt", "zh", "ja", "ko", "ru", "ar")
 
 
+def _get_transcript_via_yt_dlp(video_id: str) -> str | None:
+    """Try to get transcript using yt-dlp (different implementation; may work when youtube-transcript-api is blocked)."""
+    try:
+        import yt_dlp
+    except ImportError:
+        return None
+    import tempfile
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    with tempfile.TemporaryDirectory() as tmp:
+        outtmpl = os.path.join(tmp, "sub")
+        ydl_opts = {
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitlesformat": "srt",
+            "outtmpl": outtmpl,
+            "quiet": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        except Exception:
+            return None
+        # Find written .srt file(s)
+        for f in os.listdir(tmp):
+            if f.startswith("sub") and (f.endswith(".srt") or f.endswith(".vtt")):
+                path = os.path.join(tmp, f)
+                try:
+                    with open(path, encoding="utf-8") as fp:
+                        lines = fp.readlines()
+                    # SRT: skip sequence numbers and timestamp lines (e.g. "00:00:01,000 --> 00:00:02,500")
+                    parts = []
+                    for line in lines:
+                        line = line.strip()
+                        if not line or line.isdigit() or " --> " in line:
+                            continue
+                        parts.append(line)
+                    return " ".join(parts).strip() or None
+                except Exception:
+                    pass
+    return None
+
+
 def get_transcript(video_id: str) -> str:
-    """Fetch transcript for a YouTube video. Returns plain text. Tries multiple languages."""
+    """Fetch transcript for a YouTube video. Returns plain text. Tries multiple languages and fallbacks."""
     proxy_config = _get_transcript_proxy_config()
     api = YouTubeTranscriptApi(proxy_config=proxy_config)
     try:
         fetched = api.fetch(video_id, languages=TRANSCRIPT_LANGUAGE_FALLBACKS)
     except Exception:
         # No transcript in our fallback list; try any available language
-        transcript_list = api.list(video_id)
-        lang_codes = [t.language_code for t in transcript_list]
-        if not lang_codes:
+        try:
+            transcript_list = api.list(video_id)
+            lang_codes = [t.language_code for t in transcript_list]
+            if lang_codes:
+                fetched = api.fetch(video_id, languages=tuple(lang_codes))
+            else:
+                raise
+        except Exception:
+            # Optional: try yt-dlp (different client, sometimes not blocked)
+            yt_dlp_text = _get_transcript_via_yt_dlp(video_id)
+            if yt_dlp_text:
+                return yt_dlp_text
             raise
-        fetched = api.fetch(video_id, languages=tuple(lang_codes))
     segments = [snippet.text for snippet in fetched]
     return " ".join(segments).strip()
 
@@ -165,8 +216,59 @@ def main():
         label_visibility="collapsed",
     )
 
+    def _show_qa_result(qa_text: str, video_id: str | None, title_hint: str | None = None):
+        """Show success UI: download button, text area, optional save to folder."""
+        if video_id:
+            video_title = get_video_title(video_id)
+            if video_title:
+                safe_title = sanitize_filename(video_title)
+                txt_filename = f"interview_notes_{safe_title}_{video_id}.txt"
+            else:
+                txt_filename = f"interview_notes_{video_id}.txt"
+        else:
+            txt_filename = title_hint or "interview_notes_pasted.txt"
+        st.download_button(
+            label="📥 Download .txt to your device",
+            data=qa_text,
+            file_name=txt_filename,
+            mime="text/plain",
+            type="primary",
+        )
+        st.caption("The file will save to your **Downloads** folder (or your browser's download location).")
+        st.text_area("Interview Q&A", value=qa_text, height=400, label_visibility="collapsed")
+        try:
+            os.makedirs(SAVE_DIR, exist_ok=True)
+            save_path = os.path.join(SAVE_DIR, txt_filename)
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write(qa_text)
+            st.caption(f"Also saved on this machine at: `{save_path}`")
+        except OSError:
+            pass
+
+    with st.expander("Or paste transcript yourself (if fetch is blocked)"):
+        st.caption("On YouTube: open the video → click **⋯** under the player → **Show transcript** → copy the text.")
+        pasted = st.text_area("Pasted transcript", height=120, label_visibility="collapsed", placeholder="Paste the transcript here...", key="pasted_transcript")
+        if st.button("Generate Q&A from pasted transcript", key="paste_btn"):
+            if not (pasted and pasted.strip()):
+                st.warning("Paste the transcript text above first.")
+            else:
+                with st.spinner("Generating Q&A with Groq..."):
+                    try:
+                        text = pasted.strip()
+                        if len(text) > MAX_TRANSCRIPT_CHARS:
+                            text = text[:MAX_TRANSCRIPT_CHARS] + "\n\n[... truncated ...]"
+                        qa_text = generate_qa_with_groq(text, api_key)
+                    except Exception as e:
+                        st.error(f"Groq API error: {e}")
+                    else:
+                        if qa_text:
+                            st.success("Done! Review below and save the file to your device.")
+                            _show_qa_result(qa_text, extract_video_id(url) if url else None, "interview_notes_pasted.txt")
+                        else:
+                            st.warning("No Q&A content was returned.")
+
     if not url:
-        st.info("Enter a YouTube URL above to get started.")
+        st.info("Enter a YouTube URL above to generate from the video, or use the option above to paste a transcript.")
         return
 
     video_id = extract_video_id(url)
@@ -183,16 +285,15 @@ def main():
                 st.error(f"Failed to get transcript: {e}")
                 if "blocking" in err_msg or "cloud provider" in err_msg or "ip" in err_msg:
                     st.info(
-                        "**YouTube is blocking this server’s IP** (common on Streamlit Cloud). "
-                        "Options: (1) Run the app locally, or (2) Add a proxy in **Settings → Secrets**: "
-                        "`YT_PROXY` = `http://your-proxy:port` or use Webshare: `YT_WEBSHARE_USERNAME` and `YT_WEBSHARE_PASSWORD`."
+                        "**YouTube is blocking this server's IP.** Use **\"Or paste transcript yourself\"** above: "
+                        "on YouTube open the video → ⋯ → Show transcript → copy the text, paste it in the expander, then click **Generate Q&A from pasted transcript**."
                     )
                 else:
-                    st.caption("Make sure the video has captions available (public or auto-generated).")
+                    st.caption("Make sure the video has captions, or use the paste option above.")
                 return
 
         if not transcript:
-            st.warning("Transcript was empty. Cannot generate Q&A.")
+            st.warning("Transcript was empty. Use the paste option above with the video's transcript.")
             return
 
         with st.spinner("Generating Q&A with Groq..."):
@@ -207,35 +308,7 @@ def main():
             return
 
         st.success("Done! Review below and save the file to your device.")
-        # Filename: include video title when available for easier reference
-        video_title = get_video_title(video_id)
-        if video_title:
-            safe_title = sanitize_filename(video_title)
-            txt_filename = f"interview_notes_{safe_title}_{video_id}.txt"
-        else:
-            txt_filename = f"interview_notes_{video_id}.txt"
-
-        # Primary way for users to save locally: browser download (works for everyone, including Cloud)
-        st.download_button(
-            label="📥 Download .txt to your device",
-            data=qa_text,
-            file_name=txt_filename,
-            mime="text/plain",
-            type="primary",
-        )
-        st.caption("The file will save to your **Downloads** folder (or your browser’s download location). You can open it in any text editor.")
-
-        st.text_area("Interview Q&A", value=qa_text, height=400, label_visibility="collapsed")
-
-        # Optional: also save to a folder when running locally and path is writable
-        try:
-            os.makedirs(SAVE_DIR, exist_ok=True)
-            save_path = os.path.join(SAVE_DIR, txt_filename)
-            with open(save_path, "w", encoding="utf-8") as f:
-                f.write(qa_text)
-            st.caption(f"Also saved on this machine at: `{save_path}`")
-        except OSError:
-            pass
+        _show_qa_result(qa_text, video_id)
 
 
 if __name__ == "__main__":
