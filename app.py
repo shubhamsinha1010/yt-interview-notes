@@ -4,17 +4,39 @@ Takes a YouTube URL, fetches the transcript, and generates AI engineer interview
 """
 
 import json
-import re
 import os
+import random
+import re
 from urllib.parse import urlparse, parse_qs, quote
 from urllib.request import urlopen, Request
 
 import streamlit as st
 from dotenv import load_dotenv
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import GenericProxyConfig, WebshareProxyConfig
 from groq import Groq
 
 load_dotenv()
+
+
+def _get_transcript_proxy_config():
+    """Build optional proxy config from env (for YouTube IP blocks, e.g. on Streamlit Cloud)."""
+    # Set YT_USE_PROXY=0 to skip proxy (try direct connection — often works when running locally)
+    if os.getenv("YT_USE_PROXY", "1").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    # Webshare residential rotating (dashboard username/password)
+    ws_user = os.getenv("YT_WEBSHARE_USERNAME") or os.getenv("WEBSHARE_PROXY_USERNAME")
+    ws_pass = os.getenv("YT_WEBSHARE_PASSWORD") or os.getenv("WEBSHARE_PROXY_PASSWORD")
+    if ws_user and ws_pass:
+        return WebshareProxyConfig(proxy_username=ws_user, proxy_password=ws_pass)
+    # One or more proxy URLs (comma-separated = pick one at random; good for Webshare free 10 proxies)
+    raw = os.getenv("YT_PROXY") or os.getenv("YT_PROXY_LIST") or os.getenv("HTTP_PROXY") or os.getenv("HTTPS_PROXY")
+    if raw:
+        urls = [u.strip() for u in raw.split(",") if u.strip()]
+        if urls:
+            proxy_url = random.choice(urls)
+            return GenericProxyConfig(http_url=proxy_url, https_url=proxy_url)
+    return None
 
 # Max transcript chars to send to the LLM (Groq free tier 12k tokens/request)
 MAX_TRANSCRIPT_CHARS = 20_000
@@ -72,7 +94,8 @@ TRANSCRIPT_LANGUAGE_FALLBACKS = ("en", "hi", "es", "fr", "de", "pt", "zh", "ja",
 
 def get_transcript(video_id: str) -> str:
     """Fetch transcript for a YouTube video. Returns plain text. Tries multiple languages."""
-    api = YouTubeTranscriptApi()
+    proxy_config = _get_transcript_proxy_config()
+    api = YouTubeTranscriptApi(proxy_config=proxy_config)
     try:
         fetched = api.fetch(video_id, languages=TRANSCRIPT_LANGUAGE_FALLBACKS)
     except Exception:
@@ -156,8 +179,16 @@ def main():
             try:
                 transcript = get_transcript(video_id)
             except Exception as e:
+                err_msg = str(e).lower()
                 st.error(f"Failed to get transcript: {e}")
-                st.caption("Make sure the video has captions available (public or auto-generated).")
+                if "blocking" in err_msg or "cloud provider" in err_msg or "ip" in err_msg:
+                    st.info(
+                        "**YouTube is blocking this server’s IP** (common on Streamlit Cloud). "
+                        "Options: (1) Run the app locally, or (2) Add a proxy in **Settings → Secrets**: "
+                        "`YT_PROXY` = `http://your-proxy:port` or use Webshare: `YT_WEBSHARE_USERNAME` and `YT_WEBSHARE_PASSWORD`."
+                    )
+                else:
+                    st.caption("Make sure the video has captions available (public or auto-generated).")
                 return
 
         if not transcript:
